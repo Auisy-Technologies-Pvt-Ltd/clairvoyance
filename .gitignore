@@ -37,6 +37,8 @@ logs/
 # Environment variables
 .env
 .env.local
+.env.prod
+.env.*
 
 # IDE specific files
 .idea/
@@ -58,3 +60,12 @@ CLAUDE.local.md
 
 # Local scratch / test fixtures
 temp/
+qwen_harness/
+flipkart_template_revamp/
+
+# TTS voice-quality research workspace (generated audio, keys-free analysis)
+tts_host/
+
+# Namma Yatri call-quality RCA workspace (call data, recordings, transcripts)
+ny_debug/
+ny_quality_rca/
