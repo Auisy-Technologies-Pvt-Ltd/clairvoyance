@@ -1,0 +1,47 @@
+"""
+AWS Utils - Generalized AWS client initialization
+Provides reusable AWS client creation for various AWS services
+"""
+
+from typing import Any, Optional
+
+import boto3
+
+from app.core.config.static import (
+    AWS_ACCESS_KEY_ID,
+    AWS_REGION,
+    AWS_SECRET_ACCESS_KEY,
+)
+from app.core.logger import logger
+
+
+def get_aws_client(service_name: str) -> Optional[Any]:
+    """
+    Initializes and returns an AWS client for the specified service.
+
+    Args:
+        service_name (str): The AWS service name (e.g., 'kms', 's3', 'ec2', 'lambda')
+
+    Returns:
+        Optional[any]: The AWS client instance or None if initialization fails
+    """
+    try:
+        # Check if AWS credentials are available
+        if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+            logger.error(f"AWS credentials missing for {service_name} client")
+            return None
+
+        # Create the AWS client
+        client = boto3.client(  # type: ignore[call-overload]
+            service_name,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION,
+        )
+
+        logger.info(f"AWS {service_name} client initialized for region: {AWS_REGION}")
+        return client
+
+    except Exception as e:
+        logger.error(f"Failed to initialize AWS {service_name} client: {e}")
+        return None

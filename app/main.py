@@ -1,305 +1,501 @@
-import uvicorn
-import json
-import subprocess
-import uuid
-import time
-from pathlib import Path
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from datetime import datetime, timezone
 
-import aiohttp
-from fastapi import FastAPI, WebSocket, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from pipecat.transports.services.helpers.daily_rest import DailyRESTHelper, DailyRoomParams, DailyRoomProperties, DailyMeetingTokenParams, DailyMeetingTokenProperties
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-# Import necessary components from the new structure
-from app.ws.live_session import handle_websocket_session, get_active_connections, get_shutdown_event
-from app.core.logger import logger
-from app.core.config import DAILY_API_KEY, DAILY_API_URL, PORT, HOST
 from app import __version__
-from app.schemas import AutomaticVoiceUserConnectRequest
-from app.agents.voice.breeze_buddy.breeze.order_confirmation.types import BreezeOrderData
-from app.agents.voice.breeze_buddy.breeze.order_confirmation.websocket_bot import main as telephony_websocket_conn
-from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
-from starlette.websockets import WebSocketDisconnect
-from app.core.config import (
-    TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN,
-    TWILIO_FROM_NUMBER,
-    TWILIO_WEBSOCKET_URL,
+from app.ai.voice.agents.breeze_buddy.chat.cleanup import end_idle_chat_sessions
+from app.ai.voice.agents.breeze_buddy.dispatch import (
+    clean_stale_bb_locks,
+    monitor_dispatch_health,
+    reap_stuck_processing_lists,
+    reconcile_backlog_to_zset,
+    reconcile_channel_tokens,
+    start_promoter,
+    start_workers,
+    stop_promoter,
+    stop_workers,
+)
+from app.ai.voice.agents.breeze_buddy.managers.calls import (
+    reconcile_stuck_processing_leads,
+)
+from app.ai.voice.agents.breeze_buddy.services.agent_router.client import (
+    close_smart_router_client,
+)
+from app.ai.voice.agents.breeze_buddy.services.conversation_analysis.worker import (
+    start_analysis_worker,
+    stop_analysis_worker,
+)
+from app.ai.voice.agents.breeze_buddy.tts.dragontts.monitor import (
+    monitor_dragontts_health,
 )
 
-# Dictionary to track bot processes: {pid: (process, room_url)}
-bot_procs = {}
+# Database imports
+from app.ai.voice.llm._pools import close_all_pools as close_llm_http_pools
+from app.ai.voice.tts.catalog import get_enabled_voices as load_tts_voice_catalog
+from app.api.routers import breeze_buddy, devcycle, feature_flags, mcp, systems
+from app.api.routers.breeze_buddy.chat import cancel_bus as chat_cancel_bus
 
-# Store Daily API helpers
-daily_helpers = {}
+# Import background task scheduler
+from app.core.background_tasks import BackgroundTaskScheduler
+from app.core.config.dynamic import (
+    ENABLE_BACKGROUND_TASKS,
+    KB_INGESTION_INTERVAL_SECONDS,
+)
+from app.core.config.static import (
+    BACKGROUND_TASKS_LOOP_INTERVAL_SECONDS,
+    BB_CLEAN_STALE_LOCKS_INTERVAL_S,
+    BB_HEALTH_MONITOR_INTERVAL_S,
+    BB_REAP_PROCESSING_INTERVAL_S,
+    BB_RECONCILE_BACKLOG_INTERVAL_S,
+    BB_RECONCILE_CHANNELS_INTERVAL_S,
+    BB_RECONCILE_STUCK_PROCESSING_INTERVAL_S,
+    BLOCKING_THREAD_POOL_SIZE,
+    BOT_MAX_DRAIN_SECONDS,
+    CHAT_SESSION_END_TIMEOUT_LOOP_INTERVAL_SECONDS,
+    CORS_ALLOWED_ORIGINS,
+    CRM_ROLE,
+    ENABLE_DISPATCHER,
+    ENABLE_DRAGONTTS_KILL_SWITCH,
+    ENABLE_EVALUATIONS_WORKER,
+    ENABLE_SIGTERM_HANDLER,
+    HOST,
+    MCP_PUBLIC_ENDPOINT_ENABLED,
+    POD_ROLE,
+    PORT,
+)
 
+# Import necessary components from the new structure
+from app.core.logger import logger
+from app.core.middleware.widget_cors_bypass import CustomWidgetCorsBypassMiddleware
+from app.crm import api as crm_api
+from app.crm.worker_main import start_worker_role, stop_worker_role
+from app.database import close_db_pool, init_db_pool
+from app.services.ingest_archive import IngestArchiveMiddleware
+from app.services.knowledge_base import (
+    process_pending_documents as process_pending_kb_documents,
+)
+from app.services.langfuse.tasks.task import initialize_langfuse_tasks
+from app.services.model_provider import close_all as close_model_provider_pools
+from app.services.redis import (
+    close_redis_connections,
+    get_redis_service,
+    is_redis_configured,
+)
 
-def cleanup():
-    """Cleanup function to terminate all bot processes.
+# Flag to indicate if pod is draining (no new connections accepted)
+_is_draining = False
 
-    Called during server shutdown.
-    """
-    logger.info(f"Attempting to terminate {len(bot_procs)} bot processes.")
-    for pid, (proc, room_url) in list(bot_procs.items()):
-        try:
-            if proc.poll() is None:
-                logger.info(f"Terminating process {pid} for room {room_url}...")
-                proc.terminate()
-                proc.wait()
-                logger.info(f"Process {pid} terminated successfully.")
-            else:
-                logger.info(f"Process {pid} for room {room_url} has already terminated.")
-        except Exception as e:
-            logger.error(f"Error terminating process {pid}: {e}", exc_info=True)
-        finally:
-            # Ensure the process is removed from the tracking dictionary
-            bot_procs.pop(pid, None)
-    logger.info("All bot processes have been handled.")
+# Background task scheduler
+_background_scheduler = None
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     """FastAPI lifespan manager that handles startup and shutdown tasks."""
-    logger.info("Application startup...")
-    # Initialize aiohttp session
-    aiohttp_session = aiohttp.ClientSession()
-    daily_helpers["rest"] = DailyRESTHelper(
-        daily_api_key=DAILY_API_KEY,
-        daily_api_url=DAILY_API_URL,
-        aiohttp_session=aiohttp_session,
+    logger.info(f"Application startup... (POD_ROLE={POD_ROLE}, CRM_ROLE={CRM_ROLE})")
+
+    # Size the executor backing asyncio.to_thread() before anything can use it.
+    # See BLOCKING_THREAD_POOL_SIZE in static.py for why the default is wrong.
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=BLOCKING_THREAD_POOL_SIZE,
+            thread_name_prefix="blocking",
+        )
     )
-    logger.info("Daily REST helper initialized.")
-    
+    logger.info(
+        f"Blocking-work thread pool sized to {BLOCKING_THREAD_POOL_SIZE} workers"
+    )
+
+    # Initialize database and create tables if needed
+    try:
+        await init_db_pool()
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+    # Initialize Redis client
+    try:
+        if is_redis_configured():
+            redis_service = await get_redis_service()
+            await redis_service.get_client()  # Initialize the client
+            logger.info("Redis client initialized successfully")
+        else:
+            logger.info("Redis not configured - skipping Redis initialization")
+    except Exception as e:
+        logger.error(f"Failed to initialize Redis client: {e}")
+
+    # Start the chat cancel-bus pubsub subscriber. Fans cross-pod cancel
+    # publishes out to the local in-flight task registry so the widget
+    # Stop button releases the per-session Redis lock immediately instead
+    # of waiting on TTL. No-op + warning log if Redis isn't reachable.
+    try:
+        await chat_cancel_bus.start_subscriber()
+    except Exception as e:
+        logger.error(f"Failed to start chat cancel-bus subscriber: {e}")
+
+    # TTS voice catalog startup: parse/validate catalog.json. It touches the
+    # filesystem, so it runs here (in a thread) instead of at module import.
+    # Deliberately NOT wrapped in try/except like the external services above:
+    # catalog.json is checked-in code, so a broken file is a bad build that
+    # must fail deployment — swallowing it would serve 500s per request
+    # instead (lru_cache doesn't memoize exceptions, so the failed load would
+    # also retry blocking disk I/O on the event loop for every call).
+    def _prepare_tts_catalog() -> None:
+        load_tts_voice_catalog()
+
+    await asyncio.to_thread(_prepare_tts_catalog)
+
+    # DevCycle feature flags are initialized by parent process (run.py) before uvicorn starts
+    # Worker processes only need to read from Redis using get_config()
+    logger.info(
+        "Worker process: DevCycle flags pre-loaded by parent process, reading from Redis"
+    )
+
+    # NOTE: The Automatic analytics voice agent has been removed; its
+    # functionality is migrated to an Automatic template-driven Breeze
+    # Buddy workflow. The Daily room pool and voice-agent process pool
+    # existed solely to pre-warm Automatic sessions and were removed with
+    # it. Breeze Buddy provisions Daily rooms on demand via its own
+    # services/daily helper.
+
+    # Start background task scheduler if enabled
+    global _background_scheduler
+    if CRM_ROLE == "api" and await ENABLE_BACKGROUND_TASKS():
+        try:
+            # Create scheduler instance with configurable loop interval
+            _background_scheduler = BackgroundTaskScheduler(
+                loop_interval_seconds=BACKGROUND_TASKS_LOOP_INTERVAL_SECONDS
+            )
+
+            # Initialize Langfuse tasks (if configured)
+            await initialize_langfuse_tasks(_background_scheduler)
+
+            # Chat-mode idle session cleanup. Distributed lock comes
+            # free from the scheduler, so only one pod runs the sweep
+            # per interval. See docs/CHAT_MODE.md §7.3.
+            _background_scheduler.register_task(
+                name="chat_session_idle_cleanup",
+                func=end_idle_chat_sessions,
+                interval_seconds=CHAT_SESSION_END_TIMEOUT_LOOP_INTERVAL_SECONDS,
+            )
+
+            # Knowledge base ingestion sweeper. Uploads kick processing
+            # immediately in-process; this sweep catches kicks lost to pod
+            # restarts and requeues stale PROCESSING claims. The claim query
+            # uses FOR UPDATE SKIP LOCKED, so kick + sweep never double-work.
+            _background_scheduler.register_task(
+                name="kb_ingestion",
+                func=process_pending_kb_documents,
+                interval_seconds=await KB_INGESTION_INTERVAL_SECONDS(),
+            )
+
+            # DragonTTS health monitor — a scheduler task probes DragonTTS
+            # /health each tick and, on failure, one-way marks the health flag
+            # "0" so enable_tts_caching templates bypass the cache and use their
+            # upstream provider directly. Recovery is manual via the admin
+            # endpoint. Rides the scheduler like the reconcilers below; probe
+            # cadence is BACKGROUND_TASKS_LOOP_INTERVAL_SECONDS (default 60s).
+            # Entry point: tts/dragontts/monitor.py
+            # (health gate: tts/dragontts/health.py; kill switch: kill_switch.py).
+            if ENABLE_DRAGONTTS_KILL_SWITCH:
+                _background_scheduler.register_task(
+                    name="dragon_tts_health_check",
+                    func=monitor_dragontts_health,
+                    interval_seconds=BACKGROUND_TASKS_LOOP_INTERVAL_SECONDS,
+                )
+
+            # Event-driven dispatch reconcilers (Plane 5). Only registered on
+            # main-server pods; the scheduler's SET NX EX lock further
+            # guarantees one-pod-per-tick across the fleet. See
+            # docs/BACKLOG_DISPATCHER_REDESIGN.md §2.
+            if ENABLE_DISPATCHER:
+                _background_scheduler.register_task(
+                    name="bb_reconcile_backlog_to_zset",
+                    func=reconcile_backlog_to_zset,
+                    interval_seconds=BB_RECONCILE_BACKLOG_INTERVAL_S,
+                )
+                _background_scheduler.register_task(
+                    name="bb_reap_stuck_processing_lists",
+                    func=reap_stuck_processing_lists,
+                    interval_seconds=BB_REAP_PROCESSING_INTERVAL_S,
+                )
+                _background_scheduler.register_task(
+                    name="bb_reconcile_channel_tokens",
+                    func=reconcile_channel_tokens,
+                    interval_seconds=BB_RECONCILE_CHANNELS_INTERVAL_S,
+                )
+                _background_scheduler.register_task(
+                    name="bb_clean_stale_locks",
+                    func=clean_stale_bb_locks,
+                    interval_seconds=BB_CLEAN_STALE_LOCKS_INTERVAL_S,
+                )
+                # Stuck-PROCESSING reconciler: closes leads whose call-end
+                # webhook never arrived. Inherited from the deleted cron
+                # path; same 10-min staleness threshold.
+                _background_scheduler.register_task(
+                    name="bb_reconcile_stuck_processing_leads",
+                    func=reconcile_stuck_processing_leads,
+                    interval_seconds=BB_RECONCILE_STUCK_PROCESSING_INTERVAL_S,
+                )
+                # Health monitor: alert-only periodic check for no-leader /
+                # dispatch-halted / schedule-depth-high. Slack alerts are
+                # throttled by the alerts module; this task is safe at 60s.
+                _background_scheduler.register_task(
+                    name="bb_monitor_dispatch_health",
+                    func=monitor_dispatch_health,
+                    interval_seconds=BB_HEALTH_MONITOR_INTERVAL_S,
+                )
+
+            # Start the scheduler only if tasks are registered
+            if _background_scheduler.tasks:
+                await _background_scheduler.start()
+                logger.info("Background task scheduler started")
+            else:
+                logger.info("No background tasks registered, scheduler not started")
+        except Exception as e:
+            logger.error(f"Failed to start background task scheduler: {e}")
+    elif CRM_ROLE != "api":
+        logger.info(
+            f"CRM_ROLE={CRM_ROLE}: background task scheduler not started "
+            "(a worker pod runs exactly one loop)"
+        )
+    else:
+        logger.info(
+            "Background task scheduler disabled (ENABLE_BACKGROUND_TASKS=false)"
+        )
+
+    # Start the event-driven dispatcher (promoter + workers). Main-server
+    # workload only by default. Channel-semaphore init is handled by the
+    # reconciler — no separate boot-time initialisation logic. See §2.
+    # Gated on CRM_ROLE like the scheduler above: a pod is its role, so a
+    # CRM worker pod runs exactly one loop and never also dials voice.
+    if CRM_ROLE == "api" and ENABLE_DISPATCHER:
+        try:
+            # Fast cold-start: trigger one reconcile_channel_tokens immediately
+            # so workers don't BLPOP on empty channel LISTs while waiting for
+            # the periodic reconciler tick. Share the same SET NX EX lock key
+            # the BackgroundTaskScheduler uses for the periodic tick — that
+            # way the boot reconcile and the first scheduled tick can't run
+            # concurrently and double-topup token counts.
+            try:
+                redis_svc = await get_redis_service()
+                acquired = await redis_svc.set(
+                    key="background:task:bb_reconcile_channel_tokens:lock",
+                    value="locked",
+                    nx=True,
+                    ex=BB_RECONCILE_CHANNELS_INTERVAL_S,
+                )
+                if acquired:
+                    await reconcile_channel_tokens()
+                else:
+                    logger.info(
+                        "Boot-time channel-tokens reconcile already running on "
+                        "another pod; skipping (scheduled tick will heal)."
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Initial channel-tokens reconcile failed (will retry "
+                    f"on scheduled tick): {e}"
+                )
+
+            await start_promoter()
+            await start_workers()
+            logger.info("Event-driven dispatcher started")
+        except Exception as e:
+            logger.error(f"Failed to start event-driven dispatcher: {e}", exc_info=True)
+    elif CRM_ROLE != "api":
+        logger.info(
+            f"CRM_ROLE={CRM_ROLE}: event-driven dispatcher not started "
+            "(a worker pod runs exactly one loop)"
+        )
+    else:
+        logger.info("Event-driven dispatcher disabled (ENABLE_DISPATCHER=false)")
+
+    if ENABLE_EVALUATIONS_WORKER:
+        try:
+            await start_analysis_worker()
+        except Exception as e:
+            logger.error(f"Failed to start conversation analysis worker: {e}")
+
+    # CRM worker roles (design/worker-runtime.md): one image, N pods. A
+    # non-"api" CRM_ROLE runs its drain loop as an asyncio task in this
+    # process instead of serving HTTP — see app/crm/worker_main.py.
+    if CRM_ROLE != "api":
+        await start_worker_role(CRM_ROLE)
+        logger.info(f"CRM worker role '{CRM_ROLE}' started")
+    else:
+        logger.info("CRM_ROLE=api: no CRM worker loop started")
+
     yield
-    
+
     logger.info("Application shutdown event triggered...")
-    # Cleanup bot processes
-    cleanup()
-    # Close aiohttp session
-    await aiohttp_session.close()
-    logger.info("Aiohttp session closed.")
-    # Gracefully shutdown websocket connections
-    await shutdown_server()
+
+    # Stop the CRM worker role before scheduler/db close so an in-flight
+    # batch finishes (or times out) with the pool still open.
+    if CRM_ROLE != "api":
+        try:
+            logger.info(f"Stopping CRM worker role '{CRM_ROLE}'...")
+            await stop_worker_role()
+        except Exception as e:
+            logger.error(
+                f"Error stopping CRM worker role '{CRM_ROLE}': {e}", exc_info=True
+            )
+
+    # Stop the event-driven dispatcher before scheduler/db close so any
+    # in-flight workers get their locks/tokens released cleanly. Mirrors
+    # the startup gate — only an api pod ever started these.
+    if CRM_ROLE == "api" and ENABLE_DISPATCHER:
+        try:
+            logger.info("Stopping event-driven dispatcher...")
+            await stop_workers()
+            await stop_promoter()
+        except Exception as e:
+            logger.error(f"Error stopping dispatcher: {e}", exc_info=True)
+
+    try:
+        await stop_analysis_worker()
+    except Exception as e:
+        logger.error(f"Error stopping conversation analysis worker: {e}")
+
+    # Stop background task scheduler if running
+    if _background_scheduler:
+        logger.info("Stopping background task scheduler...")
+        await _background_scheduler.stop()
+
+    # Stop chat cancel-bus subscriber
+    try:
+        await chat_cancel_bus.stop_subscriber()
+    except Exception as e:
+        logger.error(f"Error stopping chat cancel-bus subscriber: {e}")
+
+    # Graceful drain period - wait for active sessions to complete if enabled
+    if ENABLE_SIGTERM_HANDLER and _is_draining:
+        logger.info(
+            f"Drain mode active. Waiting {BOT_MAX_DRAIN_SECONDS}s for active sessions to complete..."
+        )
+        await asyncio.sleep(BOT_MAX_DRAIN_SECONDS)
+        logger.info(
+            f"Drain period ({BOT_MAX_DRAIN_SECONDS}s) complete. Proceeding with cleanup."
+        )
+
+    # Close Smart Router client (release HTTP connection pool)
+    await close_smart_router_client()
+
+    # Close shared httpx pools used by chat LLM clients (Azure today).
+    # Drains keep-alive connections cleanly so we don't leak fds on SIGTERM.
+    await close_llm_http_pools()
+    # Same for the model providers' pooled vendor clients.
+    await close_model_provider_pools()
+    # Close database pool
+    await close_db_pool()
+    # Close Redis connections
+    await close_redis_connections()
+
+    # LAST: flush + stop loguru's enqueue=True sinks. Each enqueued sink
+    # owns a multiprocessing SimpleQueue/Event/Lock; if their worker
+    # threads are still alive at interpreter exit, resource_tracker
+    # reports the SemLocks as "leaked semaphore objects". complete()
+    # drains pending records, remove() joins the workers and frees the
+    # primitives deterministically. Nothing may log through loguru after
+    # this point, which is why it sits at the very end of shutdown.
+    try:
+        logger.info("Shutdown complete; flushing log queues.")
+        await logger.complete()
+        await asyncio.to_thread(logger.remove)
+    except Exception:  # noqa: BLE001 - never block process exit on logging
+        pass
 
 
-app = FastAPI(title="Breeze Automatic Server", version=__version__, lifespan=lifespan)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+# No public /openapi.json, /docs or /redoc: the schema is a route map of
+# every endpoint, and prod was serving it to anyone (security review, 2026-10-24).
+app = FastAPI(
+    title="BreezeBuddy-API",
+    version=__version__,
+    lifespan=lifespan,
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
 )
 
-# Mount static files directory
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Ingest archive (app/services/ingest_archive.py): two DevCycle flags copy,
+# or answer from GCS alone, POSTs on the two ingest doors, ahead of routing
+# and auth. Added BEFORE the CORS middleware so CORS stays outermost and its
+# headers are on a parked answer too.
+app.add_middleware(IngestArchiveMiddleware)
 
-@app.post("/agent/voice/breeze-buddy/{identity}/order-confirmation")
-async def trigger_order_confirmation(identity: str, order: BreezeOrderData):
-    """
-    Receives order details and triggers a order confirmation workflow.
-    """
-    if identity != "breeze":
-        raise HTTPException(status_code=404, detail="Feature not supported")
-    
-    logger.info(f"Received order: {order.order_id} for {order.customer_name}")
+# CORS — path-aware. The strict static allowlist (CORS_ALLOWED_ORIGINS)
+# still gates admin/RBAC/portal traffic, but the public widget surface
+# (/agent/voice/breeze-buddy/widget/…) bypasses it: those routes carry
+# their own permissive @router.options handlers and enforce per-merchant
+# allowed_origins inside the POST handler via widget_config. Without
+# this bypass, onboarding each new merchant would require editing this
+# env var and a rolling restart — defeating the whole point of the
+# per-widget allowlist.
+app.add_middleware(
+    CustomWidgetCorsBypassMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
-        raise HTTPException(status_code=500, detail="Twilio credentials are not configured.")
+app.include_router(
+    breeze_buddy.router, prefix="/agent/voice/breeze-buddy", tags=["Breeze Buddy"]
+)
+app.include_router(devcycle.router, prefix="", tags=["DevCycle"])
+app.include_router(
+    feature_flags.router,
+    prefix="/agent/voice/breeze-buddy",
+    tags=["Feature Flags"],
+)
 
-    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    
-    ws_url = TWILIO_WEBSOCKET_URL
+# Customer-engagement doors — mounted OUTSIDE /agent/voice/breeze-buddy
+# (ADR 0006); admin/S2S only in phase 1 (ADR 0007), auth wired per module
+# router. No "crm" in the path: the never-words stay off every surface an
+# outside team or merchant can see (ADR 0022). The app/crm package and the
+# crm_* tables keep their internal names — those are invisible outside.
+app.include_router(crm_api.router, prefix="")
 
-    voice_call_payload = VoiceResponse()
-    connect = Connect()
-    stream = Stream(url=ws_url)
-    stream.parameter(name="order_id", value=order.order_id)
-    stream.parameter(name="customer_name", value=order.customer_name)
-    stream.parameter(name="shop_name", value=order.shop_name)
-    stream.parameter(name="total_price", value=order.total_price)
-    stream.parameter(name="customer_address", value=order.customer_address)
-    stream.parameter(name="customer_mobile_number", value=order.customer_mobile_number)
-    stream.parameter(name="order_data", value=json.dumps(order.order_data.model_dump()))
-    stream.parameter(name="identity", value=identity)
-    if order.reporting_webhook_url:
-        stream.parameter(name="reporting_webhook_url", value=order.reporting_webhook_url)
-    connect.append(stream)
-    voice_call_payload.append(connect)
+# System health endpoints
+app.include_router(systems.router, prefix="", tags=["Systems"])
 
-    try:
-        call = client.calls.create(
-            to=order.customer_mobile_number,
-            from_=TWILIO_FROM_NUMBER,
-            twiml=str(voice_call_payload)
-        )
-        logger.info(f"Call initiated with SID: {call.sid}")
-        return {"status": "call_initiated", "sid": call.sid}
-    except Exception as e:
-        logger.error(f"Failed to initiate call: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+# Public MCP route (routers/mcp.py). Off by default: our engine answers these
+# URLs in process, and the route has no caller auth yet.
+if MCP_PUBLIC_ENDPOINT_ENABLED:
+    app.include_router(mcp.router, prefix="", tags=["MCP"])
 
-@app.websocket("/agent/voice/breeze-buddy/{serviceIdentifier}/callback/{workflow}")
-async def telephony_websocket_handler(serviceIdentifier: str, workflow: str, websocket: WebSocket):
-    """
-    WebSocket endpoint that accepts a connection and passes it to the
-    pipecat bot's main function.
-    """
-    
-    if serviceIdentifier != "twillio" or workflow != "order-confirmation":
-        raise HTTPException(status_code=404, detail="Feature not supported for this service or workflow")
-    
-    try:
-        # The websocket_bot_main function handles the entire
-        # lifecycle of the WebSocket connection, including accept().
-        await telephony_websocket_conn(websocket, aiohttp.ClientSession())
-    except WebSocketDisconnect:
-        logger.warning("WebSocket client disconnected.")
-    except Exception as e:
-        logger.error(f"An error occurred in the WebSocket handler: {e}")
-        await websocket.close(code=1011, reason="Internal Server Error")
-    finally:
-        logger.info("WebSocket client connection closed.")
+# TTS voice-catalog previews are served straight from the GCS bucket's public
+# URL, so this app exposes no /tts-previews route.
 
 
-# WebSocket endpoint for Gemini Live
-@app.websocket("/ws/live")
-async def websocket_endpoint(websocket: WebSocket):
-    await handle_websocket_session(websocket)
-
-# Pipecat bot endpoint
-@app.post("/agent/voice/automatic")
-async def bot_connect(request: AutomaticVoiceUserConnectRequest) -> Dict[str, Any]:
-    logger.info(f"Received new user connect request payload: {request.model_dump_json(exclude_none=True)}")
-    # 1. Validate request
-    raw_mode = request.mode
-    euler_tok = request.eulerToken
-    breeze_tok = request.breezeToken
-    shop_url = request.shopUrl
-    shop_id = request.shopId
-    shop_type = request.shopType
-    user_name = request.userName
-    tts_provider = request.ttsService.ttsProvider.value if request.ttsService else None
-    voice_name = request.ttsService.voiceName.value if request.ttsService else None
-    merchant_id = request.merchantId
-    platform_integrations = request.platformIntegrations
-
-    # 2. Create room + token
-    MAX_DURATION = 30 * 60
-    room = await daily_helpers["rest"].create_room(
-        params=DailyRoomParams(
-            properties=DailyRoomProperties(
-                exp=time.time() + MAX_DURATION,
-                eject_at_room_exp=True,
-            )
-        )
-    )
-
-    token_params = DailyMeetingTokenParams(
-        properties=DailyMeetingTokenProperties(
-            eject_after_elapsed=MAX_DURATION,
-        )
-    )
-    
-    token = await daily_helpers["rest"].get_token(
-        room.url,
-        expiry_time=MAX_DURATION,
-        eject_at_token_exp=True,
-        owner=True,
-        params=token_params,
-    )
-
-    # 3. Generate unique session ID for this subprocess
-    session_id = str(uuid.uuid4())
-    logger.bind(session_id=session_id).info(f"Generated session ID for new voice agent: {session_id}")
-
-    # 4. Build command args list
-    bot_file = "app.agents.voice.automatic"
-    cmd = [
-        "python3", "-m", bot_file,
-        "-u", room.url,
-        "-t", token,
-        "--mode", raw_mode.upper() if raw_mode else None,
-        "--session-id", session_id,
-    ]
-
-    # Add user_name and tts_service regardless of mode
-    if user_name:
-        cmd += ["--user-name", user_name]
-    if tts_provider:
-        cmd += ["--tts-provider", tts_provider]
-    if voice_name:
-        cmd += ["--voice-name", voice_name]
-    if euler_tok:
-        cmd += ["--euler-token", euler_tok]
-    if breeze_tok:
-        cmd += ["--breeze-token", breeze_tok]
-    if shop_url:
-        cmd += ["--shop-url", shop_url]
-    if shop_id:
-        cmd += ["--shop-id", shop_id]
-    if shop_type:
-        cmd += ["--shop-type", shop_type]
-    if merchant_id:
-        cmd += ["--merchant-id", merchant_id]
-    if platform_integrations:
-        cmd += ["--platform-integrations"] + platform_integrations
-
-    # 5. Launch subprocess without shell
-    logger.bind(session_id=session_id).info(f"Launching subprocess with command: {' '.join(cmd)}")
-    proc = subprocess.Popen(
-        cmd,
-        cwd=Path(__file__).parent.parent,
-        bufsize=1,
-    )
-    bot_procs[proc.pid] = (proc, room.url)
-    logger.bind(session_id=session_id).info(f"Subprocess started with PID: {proc.pid}")
-
-    return {"room_url": room.url, "token": token}
-
-
-# Serve client.html at the root
+# Root endpoint - health check
 @app.get("/")
-async def get_client_html():
-    return FileResponse("static/client.html")
-
-# Health check endpoint
-@app.get("/health")
 async def health_check():
-    logger.info("Health check endpoint called")
-    return JSONResponse({"status": "healthy"})
+    """
+    Root endpoint - health check.
 
-# Version endpoint
-@app.get("/version")
-async def get_version():
-    """Get application version."""
-    return JSONResponse({"version": __version__})
+    Returns basic service information and status.
+    """
+    return {
+        "service": "Clairvoyance API",
+        "version": __version__,
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
-# Graceful shutdown handling for WebSocket connections
-async def shutdown_server():
-    logger.info("Shutdown initiated, closing all WebSocket connections...")
-    shutdown_event = get_shutdown_event()
-    shutdown_event.set()
-    
-    active_connections = get_active_connections()
-    # Close all active WebSockets
-    for ws in list(active_connections): # Iterate over a copy
-        try:
-            await ws.close(code=1001, reason="Server shutting down")
-            if ws in active_connections:
-                active_connections.remove(ws)
-            logger.info(f"Closed WebSocket connection: {ws.client}")
-        except Exception as e:
-            logger.error(f"Error closing websocket during shutdown: {e}")
-    
-    logger.info("All WebSocket connections closed.")
+
+# Drain endpoint for Kubernetes preStop hook
+@app.get("/drain")
+async def drain():
+    """Called by Kubernetes preStop hook before sending SIGTERM"""
+    global _is_draining
+    logger.info("Drain endpoint called by Kubernetes - marking pod as draining")
+    _is_draining = True
+    return JSONResponse({"status": "draining"})
+
 
 # The main block is now only for direct execution, which is not the recommended way.
 # Uvicorn running from run.py is the standard.
